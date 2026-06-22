@@ -1,0 +1,39 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# --- Env / secrets ---
+.env
+.env.local
+
+# --- ML model cache ---
+models_cache/
+
+# --- Data (keep sample/ tracked, ignore uploads + generated) ---
+data/uploads/*
+!data/uploads/.gitkeep
+data/processed/
+
+# --- Frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# --- Reports / generated ---
+backend/app/eval/reports/
+backend/app/eval/testset/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+nul
+
+# --- Qdrant / Neo4j local storage (only if running outside docker) ---
+storage/qdrant/
+storage/neo4j/

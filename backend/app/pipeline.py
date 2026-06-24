@@ -125,6 +125,8 @@ class GraphRAGPipeline:
             return {"chunks": len(chunks), "entities": 0, "relationships": 0}
 
         total_entities = total_rels = 0
+        # Collect canonical entity names so we can embed them once for SIMILAR_TO.
+        entity_names: set[str] = set()
         for chunk in chunks:
             try:
                 extraction = self.extractor.extract(chunk)
@@ -136,17 +138,50 @@ class GraphRAGPipeline:
                 f"{e.type.lower()}:{_slug(e.name)}" for e in extraction.entities
             ]
             self.neo4j.apply_extraction(chunk, extraction)
+            for e in extraction.entities:
+                entity_names.add(e.name)
             total_entities += len(extraction.entities)
             total_rels += len(extraction.relationships)
 
         # Re-upsert chunks now that entity_ids are populated (updates payload).
         self.qdrant.upsert_chunks(chunks)
 
+        # Compute entity embeddings and write SIMILAR_TO edges (spec §3 Stage 3).
+        similar_edges = 0
+        if entity_names:
+            entity_embeddings = self._embed_entity_names(list(entity_names))
+            # Re-apply extraction with embeddings on entities (lightweight: just sets e.embedding).
+            self._store_entity_embeddings(entity_embeddings)
+            similar_edges = self.neo4j.add_similar_edges(threshold=0.82)
+
         logger.info(
-            "Ingested %s: %d chunks, %d entities, %d relationships",
-            path.name, len(chunks), total_entities, total_rels,
+            "Ingested %s: %d chunks, %d entities, %d relationships, %d similar edges",
+            path.name, len(chunks), total_entities, total_rels, similar_edges,
         )
-        return {"chunks": len(chunks), "entities": total_entities, "relationships": total_rels}
+        return {
+            "chunks": len(chunks),
+            "entities": total_entities,
+            "relationships": total_rels,
+            "similar_edges": similar_edges,
+        }
+
+    def _embed_entity_names(self, names: List[str]) -> dict[str, List[float]]:
+        """Embed canonical entity names for SIMILAR_TO edge computation."""
+        if not names:
+            return {}
+        vecs = self.embedder.encode(names)
+        return dict(zip(names, vecs))
+
+    def _store_entity_embeddings(self, embeddings: dict[str, List[float]]) -> None:
+        """Write entity embeddings onto Entity nodes in Neo4j."""
+        if not embeddings:
+            return
+        with self.neo4j._driver.session(database=settings.neo4j_database) as session:
+            for name, emb in embeddings.items():
+                session.run(
+                    "MATCH (e:Entity {name: $name}) SET e.embedding = $emb",
+                    name=name, emb=emb,
+                )
 
     def ingest_dir(self, dir_path: str | Path, *, reset: bool = False) -> List[dict]:
         """Ingest all supported files in a directory."""

@@ -96,30 +96,58 @@ class Neo4jStore:
                 chunk_index=chunk.chunk_index,
             )
 
-    def apply_extraction(self, chunk: Chunk, extraction: ExtractionResult) -> None:
-        """Write entities + relationships extracted from a chunk, wired to the chunk."""
+    def apply_extraction(self, chunk: Chunk, extraction: ExtractionResult,
+                         entity_embeddings: Optional[Dict[str, List[float]]] = None) -> None:
+        """Write entities + relationships extracted from a chunk, wired to the chunk.
+
+        entity_embeddings: optional map of canonical entity name -> embedding vector.
+        If provided, the embedding is stored on the Entity node (used by SIMILAR_TO).
+        """
         with self._driver.session(database=settings.neo4j_database) as session:
             # 1. Entities + MENTIONS edges.
             for ent in extraction.entities:
                 ent_id = f"{ent.type.lower()}:{_slug(ent.name)}"
-                session.run(
-                    """
-                    MERGE (e:Entity {id: $eid})
-                    SET e.name = $name,
-                        e.type = $type,
-                        e.aliases = $aliases,
-                        e.description = coalesce(e.description, $desc)
-                    WITH e
-                    MATCH (c:Chunk {id: $cid})
-                    MERGE (c)-[:MENTIONS]->(e)
-                    """,
-                    eid=ent_id,
-                    name=ent.name,
-                    type=ent.type,
-                    aliases=ent.aliases,
-                    desc=ent.description,
-                    cid=chunk.id,
-                )
+                embedding = (entity_embeddings or {}).get(ent.name)
+                if embedding is not None:
+                    session.run(
+                        """
+                        MERGE (e:Entity {id: $eid})
+                        SET e.name = $name,
+                            e.type = $type,
+                            e.aliases = $aliases,
+                            e.description = coalesce(e.description, $desc),
+                            e.embedding = $emb
+                        WITH e
+                        MATCH (c:Chunk {id: $cid})
+                        MERGE (c)-[:MENTIONS]->(e)
+                        """,
+                        eid=ent_id,
+                        name=ent.name,
+                        type=ent.type,
+                        aliases=ent.aliases,
+                        desc=ent.description,
+                        emb=embedding,
+                        cid=chunk.id,
+                    )
+                else:
+                    session.run(
+                        """
+                        MERGE (e:Entity {id: $eid})
+                        SET e.name = $name,
+                            e.type = $type,
+                            e.aliases = $aliases,
+                            e.description = coalesce(e.description, $desc)
+                        WITH e
+                        MATCH (c:Chunk {id: $cid})
+                        MERGE (c)-[:MENTIONS]->(e)
+                        """,
+                        eid=ent_id,
+                        name=ent.name,
+                        type=ent.type,
+                        aliases=ent.aliases,
+                        desc=ent.description,
+                        cid=chunk.id,
+                    )
 
             # 2. RELATED_TO edges (dedup evidence_chunk_ids on merge).
             for rel in extraction.relationships:
@@ -156,6 +184,45 @@ class Neo4jStore:
                 """,
                 cid=community_id, summary=community_summary, eid=entity_id,
             )
+
+    def add_similar_edges(self, threshold: float = 0.82) -> int:
+        """Write SIMILAR_TO edges between entities whose embeddings are close.
+
+        Per spec §3 Stage 3: SIMILAR_TO (Entity -> Entity, weighted by embedding
+        similarity). Computes cosine similarity in Python (Neo4j Community lacks
+        a vector index function) over entity embeddings stored in the linker.
+
+        Returns the number of SIMILAR_TO edges created.
+        """
+        import math
+
+        entities = self._all_entity_embeddings()
+        if len(entities) < 2:
+            return 0
+
+        pairs = []
+        for i, (id_a, emb_a) in enumerate(entities):
+            for id_b, emb_b in entities[i + 1:]:
+                sim = _cosine(emb_a, emb_b)
+                if sim >= threshold:
+                    pairs.append((id_a, id_b, round(sim, 4)))
+
+        if not pairs:
+            logger.info("No SIMILAR_TO edges above threshold %.2f", threshold)
+            return 0
+
+        with self._driver.session(database=settings.neo4j_database) as session:
+            for src_id, tgt_id, weight in pairs:
+                session.run(
+                    """
+                    MATCH (a:Entity {id: $a}), (b:Entity {id: $b})
+                    MERGE (a)-[r:SIMILAR_TO]->(b)
+                    SET r.weight = $w
+                    """,
+                    a=src_id, b=tgt_id, w=weight,
+                )
+        logger.info("Created %d SIMILAR_TO edges (threshold=%.2f)", len(pairs), threshold)
+        return len(pairs)
 
     # ------------------------------------------------------------------
     # Reads (retrieval)
@@ -271,6 +338,15 @@ class Neo4jStore:
         ).single()
         return rec["id"] if rec else None
 
+    def _all_entity_embeddings(self) -> List[tuple[str, List[float]]]:
+        """Read all (entity_id, embedding) pairs that have embeddings stored."""
+        with self._driver.session(database=settings.neo4j_database) as session:
+            result = session.run(
+                "MATCH (e:Entity) WHERE e.embedding IS NOT NULL "
+                "RETURN e.id AS id, e.embedding AS embedding"
+            )
+            return [(r["id"], r["embedding"]) for r in result]
+
 
 # ---------------------------------------------------------------------------
 # Cypher / node helpers
@@ -299,6 +375,15 @@ def _rel_to_dict(triple) -> Dict[str, Any]:
         "confidence": rel.get("confidence"),
         "evidence_chunk_ids": rel.get("evidence_chunk_ids", []),
     }
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    """Cosine similarity between two vectors."""
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(y * y for y in b)) or 1.0
+    return dot / (na * nb)
 
 
 def _slug(name: str) -> str:
